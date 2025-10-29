@@ -1,0 +1,1590 @@
+// ⚙️ Note: In Xcode > Build Settings > Architectures, set "Build Active Architecture Only" = YES
+// and "Excluded Architectures" = x86_64 for Release. This ensures Apple Silicon–only builds.
+import SwiftUI
+import UserNotifications
+import AppKit
+import AVFoundation
+import Combine
+import ServiceManagement
+import UniformTypeIdentifiers
+
+// MARK: - Models
+
+struct BreakExercise: Codable, Identifiable {
+    let id = UUID()
+    let title: String
+    let description: String
+    let duration: TimeInterval
+    
+    enum CodingKeys: String, CodingKey {
+        case title, description, duration
+    }
+}
+
+struct BreakSettings: Codable {
+    var microbreakInterval: TimeInterval = 10 * 60 // 10 minutes
+    var microbreakDuration: TimeInterval = 20 // 20 seconds
+    var longbreakInterval: TimeInterval = 30 * 60 // 30 minutes
+    var longbreakDuration: TimeInterval = 5 * 60 // 5 minutes
+    var isEnabled: Bool = true
+    var strictMode: Bool = false
+    var soundEnabled: Bool = true
+    var showExercises: Bool = true
+    var compactMenuBar: Bool = false
+    var separateEndSound: Bool = true
+    var voiceFeedback: Bool = false
+    var notificationsEnabled: Bool = true
+    var respectDoNotDisturb: Bool = true
+    var preNotifyMicroSeconds: TimeInterval = 10 // seconds before microbreak
+    var preNotifyLongSeconds: TimeInterval = 30 // seconds before long break
+    var skipCount: Int = 0 // Track skipped breaks for statistics
+    var completedBreaks: Int = 0 // Track completed breaks
+    // Keyboard shortcuts
+    var skipShortcut: String = "⌘X"
+    var postponeShortcut: String = "⌘P"
+}
+
+enum BreakType {
+    case microbreak
+    case longbreak
+    
+    var title: String {
+        switch self {
+        case .microbreak: return "Microbreak"
+        case .longbreak: return "Long Break"
+        }
+    }
+    
+    var exercises: [BreakExercise] {
+        switch self {
+        case .microbreak:
+            return [
+                BreakExercise(title: "Look Away", description: "Focus on something 20 feet away for 20 seconds", duration: 20),
+                BreakExercise(title: "Blink", description: "Blink rapidly for 10 seconds to refresh your eyes", duration: 20),
+                BreakExercise(title: "Eye Circles", description: "Roll your eyes in circles slowly", duration: 20),
+                BreakExercise(title: "Neck Stretch", description: "Gently tilt your head side to side", duration: 20),
+                BreakExercise(title: "Deep Breaths", description: "Take 3 deep, slow breaths", duration: 20)
+            ]
+        case .longbreak:
+            return [
+                BreakExercise(title: "Walk Around", description: "Take a short walk around your space", duration: 300),
+                BreakExercise(title: "Stretch Routine", description: "Do a full body stretch - arms, legs, back", duration: 300),
+                BreakExercise(title: "Hydrate", description: "Get a glass of water and drink it slowly", duration: 300),
+                BreakExercise(title: "Shoulder Rolls", description: "Roll shoulders backwards 10 times, then forwards", duration: 300),
+                BreakExercise(title: "Standing Break", description: "Stand up, stretch your legs, and do some light movements", duration: 300),
+                BreakExercise(title: "Window Gazing", description: "Look out a window and rest your eyes on distant objects", duration: 300)
+            ]
+        }
+    }
+}
+
+// MARK: - Break Manager
+
+@MainActor
+class BreakManager: ObservableObject {
+    @Published var settings = BreakSettings()
+    @Published var nextMicrobreakIn: TimeInterval = 0
+    @Published var nextLongbreakIn: TimeInterval = 0
+    @Published var isOnBreak = false
+    @Published var currentBreakType: BreakType?
+    @Published var currentExercise: BreakExercise?
+    @Published var breakTimeRemaining: TimeInterval = 0
+    @Published var isPaused = false
+    @Published var pausedUntil: Date?
+    @Published private var hasAppJustLaunched = true
+    
+    // Flags to coordinate simultaneous timer firings
+    private var microbreakDue: Bool = false
+    private var longbreakDue: Bool = false
+    
+    private var microbreakTimer: Timer?
+    private var longbreakTimer: Timer?
+    private var breakCountdownTimer: Timer?
+    private var updateTimer: Timer?
+    private var pauseTimer: Timer?
+    private var microbreakPreNotifyTimer: Timer?
+    private var longbreakPreNotifyTimer: Timer?
+    
+    private var audioPlayer: AVAudioPlayer?
+    private var breakEndPlayer: AVAudioPlayer?
+    
+    // Absolute schedule anchors to survive micro/long break interactions
+    private var nextMicrobreakDate: Date?
+    private var nextLongbreakDate: Date?
+    
+    init() {
+        loadSettings()
+        Task { @MainActor in
+            self.checkNotificationPermissions()
+        }
+        setupAudioPlayer()
+        setupNotificationObserver()
+        startTimers()
+    }
+    
+    private func checkNotificationPermissions() {
+        Task {
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            if settings.authorizationStatus != .authorized {
+                self.settings.notificationsEnabled = false
+            }
+        }
+    }
+    
+    private func setupNotificationObserver() {
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            Task { @MainActor in
+                self.checkNotificationPermissions()
+            }
+        }
+    }
+    
+    private func setupAudioPlayer() {
+        // Load main notification sound
+        if let soundURL = Bundle.main.url(forResource: "notification", withExtension: "wav") {
+            do {
+                self.audioPlayer = try AVAudioPlayer(contentsOf: soundURL)
+                self.audioPlayer?.prepareToPlay()
+                print("✅ Loaded notification sound")
+            } catch {
+                print("❌ Failed to initialize notification sound: \(error)")
+            }
+        } else {
+            print("⚠️ notification.wav not found in bundle")
+        }
+
+        // Load end-of-break sound
+        if let endURL = Bundle.main.url(forResource: "breakEnd", withExtension: "wav") {
+            do {
+                self.breakEndPlayer = try AVAudioPlayer(contentsOf: endURL)
+                self.breakEndPlayer?.prepareToPlay()
+                print("✅ Loaded breakEnd sound")
+            } catch {
+                print("❌ Failed to initialize breakEnd sound: \(error)")
+            }
+        }
+    }
+
+    private func playSound() {
+        guard settings.soundEnabled && !isPaused else { return }
+        if let player = audioPlayer {
+            if player.isPlaying { player.stop() }
+            player.currentTime = 0
+            player.play()
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    private func playEndSound() {
+        guard settings.soundEnabled && !isPaused else { return }
+        if let player = breakEndPlayer {
+            if player.isPlaying { player.stop() }
+            player.currentTime = 0
+            player.play()
+        } else {
+            NSSound.beep()
+        }
+    }
+    
+    private func loadSettings() {
+        if let data = UserDefaults.standard.data(forKey: "breakSettings"),
+           let decoded = try? JSONDecoder().decode(BreakSettings.self, from: data) {
+            settings = decoded
+        }
+    }
+    
+    func saveSettings() {
+        if let encoded = try? JSONEncoder().encode(settings) {
+            UserDefaults.standard.set(encoded, forKey: "breakSettings")
+            UserDefaults.standard.synchronize() // Force immediate write
+            print("✅ Settings saved successfully")
+        } else {
+            print("❌ Failed to encode settings")
+        }
+        // Immediately apply new settings by updating timers without losing schedule context
+        applySettingsImmediately()
+    }
+
+    private func applySettingsImmediately() {
+        stopTimers()
+        // Keep nextMicrobreakDate/nextLongbreakDate if possible, only update timers
+        if !isPaused {
+            startTimers()
+        }
+        // Re-register hotkeys if needed
+        GlobalHotkeyManager.shared.unregisterHotkey()
+        GlobalHotkeyManager.shared.registerHotkey()
+        GlobalHotkeyManager.shared.registerPostponeHotkeys()
+    }
+    
+    private func requestNotificationPermissions() {
+        Task {
+            do {
+                let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+                if !granted {
+                    self.settings.notificationsEnabled = false
+                }
+            } catch {
+                print("❌ Notification permission error: \(error)")
+            }
+        }
+    }
+
+    func startTimers() {
+        guard settings.isEnabled && !isPaused else { return }
+
+        stopTimers()
+
+        let now = Date()
+        // Initialize next-fire dates if needed
+        if nextMicrobreakDate == nil {
+            nextMicrobreakDate = now.addingTimeInterval(settings.microbreakInterval)
+        }
+        if nextLongbreakDate == nil {
+            nextLongbreakDate = now.addingTimeInterval(settings.longbreakInterval)
+        }
+
+        // Calculate time until next breaks
+        let microbreakInterval = max(0, nextMicrobreakDate?.timeIntervalSinceNow ?? settings.microbreakInterval)
+        let longbreakInterval = max(0, nextLongbreakDate?.timeIntervalSinceNow ?? settings.longbreakInterval)
+
+        // Update published countdowns
+        Task { @MainActor in
+            nextMicrobreakIn = microbreakInterval
+            nextLongbreakIn = longbreakInterval
+        }
+
+        // Schedule pre-break notifications for the next upcoming breaks
+        schedulePreBreakNotifications()
+
+        // Update interval: always 1.0 to update every second for countdowns
+        let updateInterval = 1.0
+        updateTimer = Timer.scheduledTimer(withTimeInterval: updateInterval, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            Task { @MainActor in
+                self.updateCountdowns()
+            }
+        }
+
+        // We want to ensure that no breaks are triggered immediately after app launch.
+        // We'll clear hasAppJustLaunched before any timer can fire a break.
+        let initialMicrobreakInterval = microbreakInterval
+        let initialLongbreakInterval = longbreakInterval
+
+        // Schedule microbreak timer (first fire), then repeating
+        microbreakTimer = Timer.scheduledTimer(withTimeInterval: max(0.1, initialMicrobreakInterval), repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            Task { @MainActor in
+                // Clear app launch flag before any break can be triggered
+                self.hasAppJustLaunched = false
+                guard !self.isOnBreak, !self.isPaused else { return }
+                // Only trigger break if not just launched
+                if !self.hasAppJustLaunched {
+                    self.microbreakDue = true
+                    self.resolveDueBreaks()
+                }
+                self.nextMicrobreakDate = Date().addingTimeInterval(self.settings.microbreakInterval)
+                // Start repeating timer for subsequent microbreaks
+                self.microbreakTimer = Timer.scheduledTimer(withTimeInterval: self.settings.microbreakInterval, repeats: true) { [weak self] _ in
+                    guard let self = self else { return }
+                    Task { @MainActor in
+                        // No need to check app launch flag anymore
+                        guard !self.isOnBreak, !self.isPaused else { return }
+                        self.microbreakDue = true
+                        self.resolveDueBreaks()
+                        self.nextMicrobreakDate = Date().addingTimeInterval(self.settings.microbreakInterval)
+                    }
+                }
+            }
+        }
+
+        // Schedule long break timer (first fire), then repeating
+        longbreakTimer = Timer.scheduledTimer(withTimeInterval: max(0.1, initialLongbreakInterval), repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            Task { @MainActor in
+                // Clear app launch flag before any break can be triggered
+                self.hasAppJustLaunched = false
+                guard !self.isOnBreak, !self.isPaused else { return }
+                // Only trigger break if not just launched
+                if !self.hasAppJustLaunched {
+                    self.longbreakDue = true
+                    self.resolveDueBreaks()
+                }
+                self.nextLongbreakDate = Date().addingTimeInterval(self.settings.longbreakInterval)
+                // Start repeating timer for subsequent long breaks
+                self.longbreakTimer = Timer.scheduledTimer(withTimeInterval: self.settings.longbreakInterval, repeats: true) { [weak self] _ in
+                    guard let self = self else { return }
+                    Task { @MainActor in
+                        // No need to check app launch flag anymore
+                        guard !self.isOnBreak, !self.isPaused else { return }
+                        self.longbreakDue = true
+                        self.resolveDueBreaks()
+                        self.nextLongbreakDate = Date().addingTimeInterval(self.settings.longbreakInterval)
+                    }
+                }
+            }
+        }
+    }
+    
+    private func resolveDueBreaks() {
+        // If both are due, prefer long break and clear microbreak
+        if longbreakDue && microbreakDue {
+            microbreakDue = false
+            longbreakDue = false
+            triggerBreak(.longbreak)
+            return
+        }
+        if longbreakDue {
+            longbreakDue = false
+            triggerBreak(.longbreak)
+            return
+        }
+        if microbreakDue {
+            microbreakDue = false
+            triggerBreak(.microbreak)
+            return
+        }
+    }
+    
+    private func updateCountdowns() {
+        guard !isOnBreak && !isPaused else { return }
+        Task { @MainActor in
+            if let microDate = nextMicrobreakDate {
+                nextMicrobreakIn = max(0, microDate.timeIntervalSinceNow)
+            }
+            if let longDate = nextLongbreakDate {
+                nextLongbreakIn = max(0, longDate.timeIntervalSinceNow)
+            }
+        }
+    }
+    
+    private func stopTimers() {
+        microbreakTimer?.invalidate()
+        microbreakTimer = nil
+        longbreakTimer?.invalidate()
+        longbreakTimer = nil
+        microbreakPreNotifyTimer?.invalidate()
+        microbreakPreNotifyTimer = nil
+        longbreakPreNotifyTimer?.invalidate()
+        longbreakPreNotifyTimer = nil
+        breakCountdownTimer?.invalidate()
+        breakCountdownTimer = nil
+        updateTimer?.invalidate()
+        updateTimer = nil
+    }
+    
+    private func restartTimers() {
+        // Deprecated: Use applySettingsImmediately instead.
+        applySettingsImmediately()
+    }
+    
+    private func isDoNotDisturbEnabled() -> Bool {
+        guard let dict = CFPreferencesCopyAppValue("dnd_prefs" as CFString, "com.apple.notificationcenterui" as CFString) as? [String: Any],
+              let userPref = dict["userPref"] as? [String: Any],
+              let enabled = userPref["enabled"] as? Bool else {
+            return false
+        }
+        return enabled
+    }
+
+    func triggerBreak(_ type: BreakType) {
+        guard !isOnBreak else { return }
+
+        // Do Not Disturb detection with respect toggle
+        if settings.respectDoNotDisturb && isDoNotDisturbEnabled() {
+            print("🔕 DND active — delaying break by 5 minutes")
+            let delay: TimeInterval = 300
+            nextMicrobreakDate = Date().addingTimeInterval(delay)
+            nextLongbreakDate = Date().addingTimeInterval(delay)
+            startTimers()
+            return
+        }
+
+        // Stop update timer while on break
+        updateTimer?.invalidate()
+        updateTimer = nil
+
+        isOnBreak = true
+        currentBreakType = type
+        microbreakDue = false
+        longbreakDue = false
+
+        breakTimeRemaining = type == .microbreak ? settings.microbreakDuration : settings.longbreakDuration
+
+        // Select random exercise if enabled
+        if settings.showExercises {
+            currentExercise = type.exercises.randomElement()
+        }
+
+        // Play notification sound
+        playSound()
+
+        // Show break window
+        showBreakWindow(type)
+
+        // Start countdown
+        breakCountdownTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            Task { @MainActor in
+                self.breakTimeRemaining -= 1
+
+                if self.breakTimeRemaining <= 0 {
+                    self.breakCountdownTimer?.invalidate()
+                    self.endBreak(completed: true)
+                    
+                    // Resume countdown updates
+                    self.updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                        guard let self = self else { return }
+                        Task { @MainActor in
+                            self.updateCountdowns()
+                        }
+                    }
+                }
+            }
+        }
+
+        // Do NOT advance nextMicrobreakDate or nextLongbreakDate here; will be set after break ends.
+
+        updateCountdowns()
+        schedulePreBreakNotifications()
+    }
+    
+    private func schedulePreBreakNotifications() {
+        microbreakPreNotifyTimer?.invalidate()
+        microbreakPreNotifyTimer = nil
+        longbreakPreNotifyTimer?.invalidate()
+        longbreakPreNotifyTimer = nil
+
+        guard settings.notificationsEnabled else { return }
+
+        let now = Date()
+        let microOffset = settings.preNotifyMicroSeconds
+        let longOffset = settings.preNotifyLongSeconds
+
+        let microRemaining = nextMicrobreakDate?.timeIntervalSince(now)
+        let longRemaining = nextLongbreakDate?.timeIntervalSince(now)
+
+        if let microRemaining, microRemaining > 0 {
+            let fireIn = max(0.1, microRemaining - microOffset)
+            microbreakPreNotifyTimer = Timer.scheduledTimer(withTimeInterval: fireIn, repeats: false) { [weak self] _ in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    // Suppress if long break is imminent
+                    if let longRemaining = self.nextLongbreakDate?.timeIntervalSince(Date()),
+                       longRemaining <= longOffset {
+                        return
+                    }
+                    self.sendPreBreakNotification(type: .microbreak)
+                }
+            }
+        }
+
+        if let longRemaining, longRemaining > 0 {
+            let fireIn = max(0.1, longRemaining - longOffset)
+            longbreakPreNotifyTimer = Timer.scheduledTimer(withTimeInterval: fireIn, repeats: false) { [weak self] _ in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    self.sendPreBreakNotification(type: .longbreak)
+                }
+            }
+        }
+    }
+    
+    private func sendPreBreakNotification(type: BreakType) {
+        guard settings.notificationsEnabled, !isPaused, !isOnBreak else { return }
+
+        let now = Date()
+        switch type {
+        case .microbreak:
+            guard let microDate = nextMicrobreakDate, microDate > now else { return }
+            if let longDate = nextLongbreakDate,
+               longDate.timeIntervalSince(now) <= settings.preNotifyLongSeconds {
+                return
+            }
+        case .longbreak:
+            guard let longDate = nextLongbreakDate, longDate > now else { return }
+        }
+
+        let content = UNMutableNotificationContent()
+        switch type {
+        case .microbreak:
+            content.title = "Microbreak in \(Int(settings.preNotifyMicroSeconds)) seconds"
+            content.body = "Get ready to rest your eyes."
+        case .longbreak:
+            content.title = "Long break in \(Int(settings.preNotifyLongSeconds)) seconds"
+            content.body = "Wrap up your current task."
+        }
+        
+        if settings.soundEnabled {
+            content.sound = .default
+        }
+        
+        content.interruptionLevel = .timeSensitive
+        
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+    
+    private func showBreakWindow(_ type: BreakType) {
+        NotificationCenter.default.post(name: .showBreakWindow, object: type)
+    }
+    
+    func skipBreak() {
+        guard !settings.strictMode else { return }
+        settings.skipCount += 1
+        saveSettings()
+
+        // Only act if we are currently on a break
+        guard isOnBreak, let type = currentBreakType else { return }
+
+        // Stop the current break countdown timer and clear break UI
+        breakCountdownTimer?.invalidate()
+        breakCountdownTimer = nil
+
+        let now = Date()
+        switch type {
+        case .microbreak:
+            // Only reschedule the microbreak timer — do NOT touch the long break timer
+            nextMicrobreakDate = now.addingTimeInterval(settings.microbreakInterval)
+            microbreakDue = false
+        case .longbreak:
+            // Only reschedule the long break timer — do NOT touch the microbreak timer
+            nextLongbreakDate = now.addingTimeInterval(settings.longbreakInterval)
+            longbreakDue = false
+        }
+
+        // Reset break state
+        isOnBreak = false
+        currentBreakType = nil
+        currentExercise = nil
+
+        // Hide the break window
+        NotificationCenter.default.post(name: .hideBreakWindow, object: nil)
+
+        // Restart timers cleanly using the existing nextMicrobreakDate/nextLongbreakDate
+        stopTimers()
+        startTimers()
+    }
+    
+    func postponeBreak() {
+        guard !settings.strictMode else { return }
+        postponeBy(minutes: 5)
+    }
+    
+    func postponeBy(minutes: Int) {
+        guard !settings.strictMode else { return }
+        let delta = TimeInterval(minutes * 60)
+        let now = Date()
+
+        if isOnBreak, let type = currentBreakType {
+            // Postpone only the active break type and stop the break without calling endBreak
+            switch type {
+            case .microbreak:
+                nextMicrobreakDate = now.addingTimeInterval(delta)
+                microbreakDue = false
+            case .longbreak:
+                nextLongbreakDate = now.addingTimeInterval(delta)
+                longbreakDue = false
+            }
+
+            // Stop break and UI
+            breakCountdownTimer?.invalidate()
+            breakCountdownTimer = nil
+            isOnBreak = false
+            currentBreakType = nil
+            currentExercise = nil
+            NotificationCenter.default.post(name: .hideBreakWindow, object: nil)
+
+            // Restart timers using the newly-postponed date(s)
+            stopTimers()
+            startTimers()
+            return
+        }
+
+        // If not currently on a break, postpone the next upcoming scheduled break
+        let microRemaining = nextMicrobreakDate?.timeIntervalSince(now) ?? Double.greatestFiniteMagnitude
+        let longRemaining = nextLongbreakDate?.timeIntervalSince(now) ?? Double.greatestFiniteMagnitude
+
+        if microRemaining <= longRemaining {
+            nextMicrobreakDate = (nextMicrobreakDate ?? now).addingTimeInterval(delta)
+            microbreakDue = false
+        } else {
+            nextLongbreakDate = (nextLongbreakDate ?? now).addingTimeInterval(delta)
+            longbreakDue = false
+        }
+
+        stopTimers()
+        startTimers()
+    }
+    
+    private func endBreak(completed: Bool) {
+        Task { @MainActor in
+            if completed {
+                settings.completedBreaks += 1
+                saveSettings()
+            }
+
+            // After break ends, set nextMicrobreakDate and nextLongbreakDate based on now
+            let now = Date()
+            if let lastBreakType = currentBreakType {
+                switch lastBreakType {
+                case .microbreak:
+                    nextMicrobreakDate = now.addingTimeInterval(settings.microbreakInterval)
+                case .longbreak:
+                    nextLongbreakDate = now.addingTimeInterval(settings.longbreakInterval)
+                    nextMicrobreakDate = now.addingTimeInterval(settings.microbreakInterval)
+                }
+            }
+
+            isOnBreak = false
+            currentBreakType = nil
+            currentExercise = nil
+            breakCountdownTimer?.invalidate()
+
+            playEndSound()
+
+            NotificationCenter.default.post(name: .hideBreakWindow, object: nil)
+
+            if !isPaused {
+                startTimers()
+            }
+        }
+    }
+    
+    func togglePause() {
+        isPaused.toggle()
+        pausedUntil = nil
+        pauseTimer?.invalidate()
+        pauseTimer = nil
+        
+        if isPaused {
+            stopTimers()
+        } else {
+            microbreakDue = false
+            longbreakDue = false
+            startTimers()
+        }
+    }
+    
+    func pauseFor(hours: Int) {
+        let pauseDuration = TimeInterval(hours * 3600)
+        pausedUntil = Date().addingTimeInterval(pauseDuration)
+        isPaused = true
+        stopTimers()
+        
+        pauseTimer = Timer.scheduledTimer(withTimeInterval: pauseDuration, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            Task { @MainActor in
+                self.resumeFromTimedPause()
+            }
+        }
+    }
+    
+    private func resumeFromTimedPause() {
+        isPaused = false
+        pausedUntil = nil
+        pauseTimer = nil
+        startTimers()
+    }
+    
+    var timeUntilResume: TimeInterval? {
+        guard let pausedUntil = pausedUntil else { return nil }
+        return max(0, pausedUntil.timeIntervalSinceNow)
+    }
+    
+    var breakProgress: Double {
+        guard isOnBreak else { return 0 }
+        let total = (currentBreakType == .microbreak) ? settings.microbreakDuration : settings.longbreakDuration
+        guard total > 0 else { return 0 }
+        return max(0, min(1, 1 - breakTimeRemaining / total))
+    }
+}
+
+// MARK: - Notification Names
+
+extension Notification.Name {
+    static let showBreakWindow = Notification.Name("showBreakWindow")
+    static let hideBreakWindow = Notification.Name("hideBreakWindow")
+}
+
+// MARK: - Break Window
+
+struct BreakWindow: View {
+    @ObservedObject var manager: BreakManager
+    let type: BreakType
+
+    var body: some View {
+        ZStack {
+            // Dark semi-transparent overlay
+            Color.black.opacity(0.85)
+                .ignoresSafeArea()
+
+            // Centered content card
+            VStack(spacing: 0) {
+                // Icon and title section
+                VStack(spacing: 20) {
+                    Image(systemName: "eye.fill")
+                        .font(.system(size: 60, weight: .light))
+                        .foregroundColor(.white)
+                        .symbolRenderingMode(.hierarchical)
+
+                    Text(type.title)
+                        .font(.system(size: 52, weight: .semibold))
+                        .foregroundColor(.white)
+                }
+                .padding(.top, 60)
+                .padding(.bottom, 30)
+
+                // Exercise instruction
+                if let exercise = manager.currentExercise, manager.settings.showExercises {
+                    Text(exercise.title)
+                        .font(.system(size: 28, weight: .regular))
+                        .foregroundColor(.white)
+                        .padding(.bottom, 8)
+                    
+                    Text(exercise.description)
+                        .font(.system(size: 18, weight: .regular))
+                        .foregroundColor(.white.opacity(0.8))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 40)
+                        .padding(.bottom, 40)
+                } else {
+                    Text(type == .microbreak ? "Take 3 deep, slow breaths" : "Deep Breaths")
+                        .font(.system(size: 28, weight: .regular))
+                        .foregroundColor(.white)
+                        .padding(.bottom, 40)
+                }
+
+                // Timer display
+                Text(timeString(manager.breakTimeRemaining))
+                    .font(.system(size: 72, weight: .thin, design: .rounded))
+                    .foregroundColor(.white)
+                    .monospacedDigit()
+                    .padding(.bottom, 50)
+
+                // Action buttons
+                if !manager.settings.strictMode {
+                    HStack(spacing: 16) {
+                        VStack(spacing: 4) {
+                            Button(action: {
+                                manager.skipBreak()
+                            }) {
+                                Text("Skip")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 32)
+                                    .padding(.vertical, 12)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .fill(Color.white.opacity(0.2))
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            .keyboardShortcut("x", modifiers: .command)
+                            Text(manager.settings.skipShortcut)
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+                        VStack(spacing: 4) {
+                            Menu {
+                                Button("5 minutes") { manager.postponeBy(minutes: 5) }
+                                Button("10 minutes") { manager.postponeBy(minutes: 10) }
+                                Button("15 minutes") { manager.postponeBy(minutes: 15) }
+                            } label: {
+                                Text("Postpone")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 32)
+                                    .padding(.vertical, 12)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .fill(Color.white.opacity(0.2))
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            Text("⌘⌥5 / ⌘⌥0 / ⌘⌥1")
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+                    }
+                    .padding(.bottom, 60)
+                }
+            }
+            .frame(maxWidth: 700)
+        }
+    }
+
+    private func timeString(_ interval: TimeInterval) -> String {
+        let minutes = Int(interval) / 60
+        let seconds = Int(interval) % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+
+
+// MARK: - App Delegate
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    var statusItem: NSStatusItem!
+    var popover: NSPopover!
+    var eventMonitor: Any?
+    var manager: BreakManager!
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        manager = BreakWindowController.shared.manager
+        // Register the global hotkey for skipping break
+        GlobalHotkeyManager.shared.registerHotkey()
+        setupStatusItem()
+        setupEventMonitor()
+        setupBreakWindowObservers()
+    }
+    
+    private func setupStatusItem() {
+        let contentView = MenuBarView(manager: manager)
+
+        popover = NSPopover()
+        popover.contentSize = NSSize(width: 280, height: 300)
+        popover.behavior = .transient
+        popover.contentViewController = NSHostingController(rootView: contentView)
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            button.image = NSImage(systemSymbolName: "clock", accessibilityDescription: "BreakTime")
+            button.action = #selector(togglePopover(_:))
+            button.target = self
+        }
+    }
+    
+    private func setupEventMonitor() {
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self = self, self.popover.isShown else { return }
+            self.closePopoverIfNeeded()
+        }
+    }
+    
+    private func closePopoverIfNeeded() {
+        if let window = popover.contentViewController?.view.window {
+            let mouseLocation = NSEvent.mouseLocation
+            if !NSPointInRect(mouseLocation, window.frame) {
+                popover.performClose(nil)
+            }
+        }
+    }
+    
+    private func setupBreakWindowObservers() {
+        NotificationCenter.default.addObserver(
+            forName: .showBreakWindow,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self = self, let type = note.object as? BreakType else { return }
+            // Close popover if open when break starts
+            if self.popover.isShown {
+                self.popover.performClose(nil)
+            }
+            BreakWindowController.shared.show(type: type, manager: self.manager)
+        }
+        
+        NotificationCenter.default.addObserver(
+            forName: .hideBreakWindow,
+            object: nil,
+            queue: .main
+        ) { _ in
+            BreakWindowController.shared.hide()
+        }
+    }
+    
+    @objc func togglePopover(_ sender: AnyObject?) {
+        guard let button = statusItem.button else { return }
+        
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            // Recreate the content view each time to ensure fresh state
+            let contentView = MenuBarView(manager: manager)
+            popover.contentViewController = NSHostingController(rootView: contentView)
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+    
+    deinit {
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+    }
+}
+
+// MARK: - Break Window Controller
+
+class BreakWindowController {
+    static let shared = BreakWindowController()
+    private var window: NSWindow?
+    let manager = BreakManager()
+
+    func show(type: BreakType, manager: BreakManager) {
+        guard window == nil else { return }
+
+        let contentView = BreakWindow(manager: manager, type: type)
+        let hosting = NSHostingController(rootView: contentView)
+
+        let fixedWidth: CGFloat = 700
+        let fixedHeight: CGFloat = 500
+
+        let newWindow = NSWindow(contentViewController: hosting)
+
+        // Set the content size to fixed dimensions for visual balance
+        newWindow.setContentSize(NSSize(width: fixedWidth, height: fixedHeight))
+
+        // Make window non-activating and floating
+        newWindow.level = .floating
+        newWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        newWindow.styleMask = [.borderless, .fullSizeContentView]
+        newWindow.isOpaque = false
+        newWindow.backgroundColor = .clear
+        newWindow.hasShadow = false
+        newWindow.ignoresMouseEvents = false  // Allow interaction with buttons
+
+        // Center the window on the appropriate screen using the fixed size
+        if let screen = NSScreen.main {
+            let screenRect = screen.frame
+            let x = screenRect.origin.x + (screenRect.width - fixedWidth) / 2
+            let y = screenRect.origin.y + (screenRect.height - fixedHeight) / 2
+            newWindow.setFrame(NSRect(x: x, y: y, width: fixedWidth, height: fixedHeight), display: true)
+        }
+
+        // Show the window on all spaces, but do not activate or interfere with other apps
+        newWindow.orderFrontRegardless()
+
+        self.window = newWindow
+    }
+
+    func hide() {
+        window?.close()
+        window = nil
+    }
+}
+
+@main
+struct BreakTimeApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @StateObject var manager = BreakWindowController.shared.manager
+
+    var body: some Scene {
+        Settings { SettingsView(manager: manager) }
+    }
+}
+
+// MARK: - Settings View
+
+struct SettingsView: View {
+    @ObservedObject var manager: BreakManager
+    @Environment(\.dismiss) var dismiss
+    @State private var showingSaveAlert = false
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Break Settings")
+                .font(.title)
+                .padding(.top)
+            
+            Form {
+                Section("Microbreak") {
+                    HStack {
+                        Text("Every")
+                        TextField("", value: Binding(
+                            get: { manager.settings.microbreakInterval / 60 },
+                            set: { manager.settings.microbreakInterval = max(1, $0) * 60 }
+                        ), format: .number)
+                            .frame(width: 60)
+                            .textFieldStyle(.roundedBorder)
+                        Text("minutes")
+                    }
+                    
+                    HStack {
+                        Text("Duration")
+                        TextField("", value: Binding(
+                            get: { manager.settings.microbreakDuration },
+                            set: { manager.settings.microbreakDuration = max(10, $0) }
+                        ), format: .number)
+                            .frame(width: 60)
+                            .textFieldStyle(.roundedBorder)
+                        Text("seconds")
+                    }
+                }
+                
+                Section("Long Break") {
+                    HStack {
+                        Text("Every")
+                        TextField("", value: Binding(
+                            get: { manager.settings.longbreakInterval / 60 },
+                            set: { manager.settings.longbreakInterval = max(5, $0) * 60 }
+                        ), format: .number)
+                            .frame(width: 60)
+                            .textFieldStyle(.roundedBorder)
+                        Text("minutes")
+                    }
+                    
+                    HStack {
+                        Text("Duration")
+                        TextField("", value: Binding(
+                            get: { manager.settings.longbreakDuration / 60 },
+                            set: { manager.settings.longbreakDuration = max(1, $0) * 60 }
+                        ), format: .number)
+                            .frame(width: 60)
+                            .textFieldStyle(.roundedBorder)
+                        Text("minutes")
+                    }
+                }
+                
+                Section("Options") {
+                    Toggle("Strict Mode (Can't skip breaks)", isOn: $manager.settings.strictMode)
+                    Toggle("Show Exercise Suggestions", isOn: $manager.settings.showExercises)
+                    Toggle("Play Notification Sound", isOn: $manager.settings.soundEnabled)
+                    
+                    Toggle("Enable Notifications", isOn: Binding(
+                        get: { manager.settings.notificationsEnabled },
+                        set: { newValue in
+                            manager.settings.notificationsEnabled = newValue
+                            if newValue {
+                                Task {
+                                    let settings = await UNUserNotificationCenter.current().notificationSettings()
+                                    if settings.authorizationStatus != .authorized {
+                                        do {
+                                            let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+                                            if !granted {
+                                                await MainActor.run {
+                                                    manager.settings.notificationsEnabled = false
+                                                }
+                                            }
+                                        } catch {
+                                            print("Notification auth error: \(error)")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ))
+
+                    NotificationStatusView()
+
+                    Toggle("Respect Do Not Disturb", isOn: $manager.settings.respectDoNotDisturb)
+                    
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Pre-notify microbreak")
+                        Spacer()
+                        TextField("", value: Binding(
+                            get: { manager.settings.preNotifyMicroSeconds },
+                            set: { manager.settings.preNotifyMicroSeconds = max(0, min($0, 120)) }
+                        ), format: .number)
+                        .frame(width: 60)
+                        .textFieldStyle(.roundedBorder)
+                        Text("sec")
+                    }
+                    .help("0–120 seconds before the microbreak")
+                    
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Pre-notify long break")
+                        Spacer()
+                        TextField("", value: Binding(
+                            get: { manager.settings.preNotifyLongSeconds },
+                            set: { manager.settings.preNotifyLongSeconds = max(0, min($0, 300)) }
+                        ), format: .number)
+                        .frame(width: 60)
+                        .textFieldStyle(.roundedBorder)
+                        Text("sec")
+                    }
+                    .help("0–300 seconds before the long break")
+                }
+                
+                Section("Statistics") {
+                    HStack {
+                        Text("Completed breaks:")
+                        Spacer()
+                        Text("\(manager.settings.completedBreaks)")
+                            .foregroundStyle(.secondary)
+                    }
+                    
+                    HStack {
+                        Text("Skipped breaks:")
+                        Spacer()
+                        Text("\(manager.settings.skipCount)")
+                            .foregroundStyle(.secondary)
+                    }
+                    
+                    if manager.settings.completedBreaks + manager.settings.skipCount > 0 {
+                        let total = manager.settings.completedBreaks + manager.settings.skipCount
+                        let rate = Double(manager.settings.completedBreaks) / Double(total) * 100
+                        HStack {
+                            Text("Completion rate:")
+                            Spacer()
+                            Text(String(format: "%.1f%%", rate))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    
+                    Button("Reset Statistics") {
+                        manager.settings.completedBreaks = 0
+                        manager.settings.skipCount = 0
+                        manager.saveSettings()
+                    }
+                    .buttonStyle(.bordered)
+                }
+                
+                Section("Keyboard Shortcuts") {
+                    HStack {
+                        Text("Skip Break")
+                        Spacer()
+                        TextField("Shortcut", text: Binding(
+                            get: { manager.settings.skipShortcut },
+                            set: { manager.settings.skipShortcut = $0 }
+                        ))
+                        .frame(width: 60)
+                        .textFieldStyle(.roundedBorder)
+                    }
+                    HStack {
+                        Text("Postpone Break")
+                        Spacer()
+                        TextField("Shortcut", text: Binding(
+                            get: { manager.settings.postponeShortcut },
+                            set: { manager.settings.postponeShortcut = $0 }
+                        ))
+                        .frame(width: 60)
+                        .textFieldStyle(.roundedBorder)
+                    }
+                }
+                Section("Launch") {
+                    HStack {
+                        Toggle("Start automatically at login", isOn: Binding(
+                            get: { LaunchAtLogin.isEnabled },
+                            set: { LaunchAtLogin.isEnabled = $0 }
+                        ))
+                        
+                        Spacer()
+                        
+                        Button("Configure") {
+                            LaunchAtLogin.openSystemPreferences()
+                        }
+                        .buttonStyle(.link)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            
+            HStack {
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                
+                Button("Save") {
+                    manager.saveSettings()
+                    showingSaveAlert = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        dismiss()
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            
+            if showingSaveAlert {
+                Text("Settings saved successfully!")
+                    .font(.caption)
+                    .foregroundColor(.green)
+            }
+            
+            HStack {
+                Button("Export Settings") {
+                    SettingsIO.export(settings: manager.settings)
+                }
+                Button("Import Settings") {
+                    if let imported = SettingsIO.import() {
+                        manager.settings = imported
+                        manager.saveSettings()
+                    }
+                }
+            }
+            .padding(.bottom)
+        }
+        .frame(width: 500, height: 680)
+    }
+}
+
+private struct NotificationStatusView: View {
+    @State private var authorizationStatus: UNAuthorizationStatus = .notDetermined
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if authorizationStatus != .authorized {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text("Notifications are disabled in System Settings. To receive pre-break alerts, enable notifications for BreakTime.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Button {
+                    openSystemNotificationSettings()
+                } label: {
+                    Label("Open Notification Settings", systemImage: "gearshape")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .padding(.top, 2)
+            }
+        }
+        .onAppear(perform: refresh)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refresh()
+        }
+    }
+
+    private func refresh() {
+        Task {
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            await MainActor.run {
+                authorizationStatus = settings.authorizationStatus
+            }
+        }
+    }
+}
+
+// MARK: - Launch at Login Helper
+
+struct LaunchAtLogin {
+    static var isEnabled: Bool {
+        get {
+            guard let bundleID = Bundle.main.bundleIdentifier else { return false }
+            let helperIdentifier = "\(bundleID).LoginHelper"
+            let service = SMAppService.loginItem(identifier: helperIdentifier)
+            return service.status == .enabled
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "LaunchAtLogin")
+            guard let bundleID = Bundle.main.bundleIdentifier else { return }
+            let helperIdentifier = "\(bundleID).LoginHelper"
+            let service = SMAppService.loginItem(identifier: helperIdentifier)
+            do {
+                if newValue {
+                    try service.register()
+                } else {
+                    try service.unregister()
+                }
+            } catch {
+                NSLog("LaunchAtLogin: Failed to update login item: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    static func openSystemPreferences() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
+private func openSystemNotificationSettings() {
+    if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+        NSWorkspace.shared.open(url)
+    }
+}
+
+// MARK: - Settings Import/Export
+
+struct SettingsIO {
+    static func export(settings: BreakSettings) {
+        guard let data = try? JSONEncoder().encode(settings) else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType.json]
+        panel.nameFieldStringValue = "BreakTimeSettings.json"
+        panel.begin { response in
+            if response == .OK, let url = panel.url {
+                try? data.write(to: url)
+            }
+        }
+    }
+
+    static func `import`() -> BreakSettings? {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType.json]
+        panel.allowsMultipleSelection = false
+        let response = panel.runModal()
+        if response == .OK,
+           let url = panel.url,
+           let data = try? Data(contentsOf: url),
+           let decoded = try? JSONDecoder().decode(BreakSettings.self, from: data) {
+            return decoded
+        }
+        return nil
+    }
+}
+
+// MARK: - Menu Bar View
+
+struct MenuBarView: View {
+    @ObservedObject var manager: BreakManager
+    @State private var showSettings = false
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "clock")
+                    .foregroundStyle(.secondary)
+                Text("BreakTime")
+                    .font(.headline)
+                Spacer()
+                Image(systemName: manager.isPaused ? "pause.circle.fill" : "play.circle.fill")
+                    .foregroundColor(manager.isPaused ? .orange : .green)
+            }
+            .padding(.bottom, 2)
+            
+            Divider()
+            
+            VStack(spacing: 8) {
+                if !manager.isPaused {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Image(systemName: "eye")
+                            Text("Next microbreak:")
+                            Spacer()
+                            Text(timeString(manager.nextMicrobreakIn))
+                                .font(.system(.body, design: .monospaced))
+                                .opacity(manager.isPaused ? 0.5 : 1.0)
+                        }
+                        
+                        HStack {
+                            Image(systemName: "figure.walk")
+                            Text("Next long break:")
+                            Spacer()
+                            Text(timeString(manager.nextLongbreakIn))
+                                .font(.system(.body, design: .monospaced))
+                                .opacity(manager.isPaused ? 0.5 : 1.0)
+                        }
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Paused")
+                            .foregroundColor(.secondary)
+                            .font(.headline)
+                        
+                        if let timeRemaining = manager.timeUntilResume, timeRemaining > 0 {
+                            Text("Resuming in \(pauseTimeString(timeRemaining))")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 6)
+            
+            Divider()
+            
+            Button(action: { manager.togglePause() }) {
+                Label(manager.isPaused ? "Resume Now" : "Pause", systemImage: manager.isPaused ? "play.fill" : "pause.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            
+            Menu {
+                Button("1 hour") { manager.pauseFor(hours: 1) }
+                Button("2 hours") { manager.pauseFor(hours: 2) }
+                Button("3 hours") { manager.pauseFor(hours: 3) }
+                Button("4 hours") { manager.pauseFor(hours: 4) }
+                Button("5 hours") { manager.pauseFor(hours: 5) }
+            } label: {
+                Label("Pause for...", systemImage: "clock")
+                    .frame(maxWidth: .infinity)
+            }
+            .controlSize(.large)
+            
+            Button(action: { showSettings = true }) {
+                Label("Settings", systemImage: "gear")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            
+            Divider()
+            
+            Button(action: { NSApplication.shared.terminate(nil) }) {
+                Label("Quit", systemImage: "xmark.circle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .tint(.red)
+        }
+        .padding(.all, 14)
+        .frame(width: 300)
+        .sheet(isPresented: $showSettings) {
+            SettingsView(manager: manager)
+        }
+    }
+    
+    private func pauseTimeString(_ interval: TimeInterval) -> String {
+        let clamped = max(0, interval)
+        let hours = Int(clamped) / 3600
+        let minutes = (Int(clamped) % 3600) / 60
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        } else {
+            return "\(minutes)m"
+        }
+    }
+
+    // Show countdown in M:SS format, never negative.
+    private func timeString(_ interval: TimeInterval) -> String {
+        let clamped = max(0, Int(interval))
+        let minutes = clamped / 60
+        let seconds = clamped % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+// MARK: - Global Hotkey Manager
+
+import Carbon.HIToolbox
+
+class GlobalHotkeyManager {
+    static let shared = GlobalHotkeyManager()
+    private var hotKeyRef: EventHotKeyRef?
+    private var eventHandler: EventHandlerRef?
+    private var postponeHotKeyRefs: [EventHotKeyRef] = []
+    private var postponeEventHandlers: [EventHandlerRef] = []
+
+    func registerHotkey() {
+        unregisterHotkey()
+
+        // Default: Cmd+X. Customizable in settings.
+        let manager = BreakWindowController.shared.manager
+        let shortcut = manager.settings.skipShortcut
+        let (keyCode, modifiers) = Self.parseShortcut(shortcut)
+        let hotKeyID = EventHotKeyID(signature: OSType("BRKT".fourCharCodeValue), id: UInt32(1))
+        RegisterEventHotKey(UInt32(keyCode), modifiers, hotKeyID, GetEventDispatcherTarget(), 0, &hotKeyRef)
+
+        let callback: EventHandlerUPP = { (nextHandler, eventRef, userData) in
+            var hotKeyID = EventHotKeyID()
+            GetEventParameter(eventRef, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout.size(ofValue: hotKeyID), nil, &hotKeyID)
+            if hotKeyID.id == 1 {
+                Task { @MainActor in
+                    let manager = BreakWindowController.shared.manager
+                    if manager.isOnBreak {
+                        manager.skipBreak()
+                    }
+                }
+            }
+            return noErr
+        }
+
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetEventDispatcherTarget(), callback, 1, &eventType, nil, &eventHandler)
+    }
+
+    func unregisterHotkey() {
+        if let hotKeyRef { UnregisterEventHotKey(hotKeyRef) }
+        if let eventHandler { RemoveEventHandler(eventHandler) }
+        hotKeyRef = nil
+        eventHandler = nil
+        // Unregister postpone hotkeys
+        for ref in postponeHotKeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        for handler in postponeEventHandlers {
+            RemoveEventHandler(handler)
+        }
+        postponeHotKeyRefs.removeAll()
+        postponeEventHandlers.removeAll()
+    }
+
+    func registerPostponeHotkeys() {
+        // Unregister previous
+        for ref in postponeHotKeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        for handler in postponeEventHandlers {
+            RemoveEventHandler(handler)
+        }
+        postponeHotKeyRefs.removeAll()
+        postponeEventHandlers.removeAll()
+
+        _ = BreakWindowController.shared.manager
+        // Cmd+Option+5
+        registerPostponeHotkey(keyCode: kVK_ANSI_5, modifiers: UInt32(cmdKey | optionKey), minutes: 5)
+        // Cmd+Option+0
+        registerPostponeHotkey(keyCode: kVK_ANSI_0, modifiers: UInt32(cmdKey | optionKey), minutes: 10)
+        // Cmd+Option+1
+        registerPostponeHotkey(keyCode: kVK_ANSI_1, modifiers: UInt32(cmdKey | optionKey), minutes: 15)
+    }
+
+    private func registerPostponeHotkey(keyCode: Int, modifiers: UInt32, minutes: Int) {
+        var hotKeyRef: EventHotKeyRef?
+        // Use unique id for each postpone hotkey: 100 + minutes
+        let hotKeyID = EventHotKeyID(signature: OSType("BRKT".fourCharCodeValue), id: UInt32(100 + minutes))
+        RegisterEventHotKey(UInt32(keyCode), modifiers, hotKeyID, GetEventDispatcherTarget(), 0, &hotKeyRef)
+        if let hk = hotKeyRef {
+            postponeHotKeyRefs.append(hk)
+        }
+
+        let callback: EventHandlerUPP = { (nextHandler, eventRef, userData) in
+            var hotKeyID = EventHotKeyID()
+            GetEventParameter(eventRef, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout.size(ofValue: hotKeyID), nil, &hotKeyID)
+            // Postpone hotkey IDs: 105, 110, 115
+            if hotKeyID.id == 105 || hotKeyID.id == 110 || hotKeyID.id == 115 {
+                let minutes: Int
+                switch hotKeyID.id {
+                case 105: minutes = 5
+                case 110: minutes = 10
+                case 115: minutes = 15
+                default: return noErr
+                }
+                Task { @MainActor in
+                    let manager = BreakWindowController.shared.manager
+                    if manager.isOnBreak {
+                        manager.postponeBy(minutes: minutes)
+                    }
+                }
+            }
+            return noErr
+        }
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        var eventHandler: EventHandlerRef?
+        InstallEventHandler(GetEventDispatcherTarget(), callback, 1, &eventType, nil, &eventHandler)
+        if let handler = eventHandler {
+            postponeEventHandlers.append(handler)
+        }
+    }
+
+    // Helper to parse shortcut string (e.g. "⌘X") to keyCode and modifiers
+    static func parseShortcut(_ shortcut: String) -> (Int, UInt32) {
+        // Only supports Cmd+X and Cmd+P for now. Expand as needed.
+        let lower = shortcut.lowercased()
+        if lower == "⌘x" || lower == "cmd+x" {
+            return (kVK_ANSI_X, UInt32(cmdKey))
+        }
+        if lower == "⌘p" || lower == "cmd+p" {
+            return (kVK_ANSI_P, UInt32(cmdKey))
+        }
+        // Fallback: Cmd+X
+        return (kVK_ANSI_X, UInt32(cmdKey))
+    }
+}
+
+private extension String {
+    var fourCharCodeValue: FourCharCode {
+        var result: FourCharCode = 0
+        if let data = data(using: .macOSRoman), data.count == 4 {
+            _ = data.withUnsafeBytes { memcpy(&result, $0.baseAddress!, 4) }
+        }
+        return result
+    }
+}
